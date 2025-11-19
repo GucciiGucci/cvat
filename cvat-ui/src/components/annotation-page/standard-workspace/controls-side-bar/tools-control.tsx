@@ -15,7 +15,9 @@ import Icon, {
 import Popover from 'antd/lib/popover';
 import Select from 'antd/lib/select';
 import Button from 'antd/lib/button';
+import InputNumber from 'antd/lib/input-number';
 import Modal from 'antd/lib/modal';
+import Slider from 'antd/lib/slider';
 import Text from 'antd/lib/typography/Text';
 import Tabs from 'antd/lib/tabs';
 import { Row, Col } from 'antd/lib/grid';
@@ -31,6 +33,7 @@ import {
     MinimalShape, InteractorResults, TrackerResults,
 } from 'cvat-core-wrapper';
 import openCVWrapper, { MatType } from 'utils/opencv-wrapper/opencv-wrapper';
+import { clamp } from 'utils/math';
 import {
     CombinedState, ActiveControl, ToolsBlockerState,
 } from 'reducers';
@@ -152,6 +155,7 @@ interface State {
     approxPolyAccuracy: number;
     mode: 'detection' | 'interaction' | 'tracking';
     portals: React.ReactPortal[];
+    maskThreshold: number | null;
 }
 
 type DetectorResults = Extract<Awaited<ReturnType<typeof core.lambda.call>>, { version: number }>;
@@ -219,6 +223,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             rle: number[];
             points: [number, number][];
             bounds?: [number, number, number, number];
+            mask?: number[][];
+            threshold: number | null;
         };
         latestPostponedEvent: Event | null;
         latestApproximatedPoints: number[][];
@@ -233,6 +239,10 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         } | null;
         hideMessage: (() => void) | null;
     };
+
+    private maskPreviewUpdateInProgress = false;
+
+    private pendingMaskPreview: number | null = null;
 
     public constructor(props: Props) {
         super(props);
@@ -251,6 +261,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             pointsReceived: false,
             mode: 'interaction',
             portals: [],
+            maskThreshold: null,
         };
 
         this.interaction = {
@@ -260,6 +271,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             latestResponse: {
                 rle: [],
                 points: [],
+                mask: [],
+                threshold: null,
             },
             latestApproximatedPoints: [],
             latestRequest: null,
@@ -285,7 +298,13 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         const {
             isActivated, defaultApproxPolyAccuracy, canvasInstance, states, toolsBlockerState,
         } = this.props;
-        const { approxPolyAccuracy, mode, activeTracker } = this.state;
+        const {
+            approxPolyAccuracy,
+            mode,
+            activeTracker,
+            convertMasksToPolygons,
+            maskThreshold,
+        } = this.state;
 
         if (prevProps.states !== states || prevState.activeTracker !== activeTracker) {
             this.setState({
@@ -306,15 +325,23 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 id: null,
                 isAborted: false,
                 latestPostponedEvent: null,
-                latestResponse: { rle: [], points: [] },
+                latestResponse: {
+                    rle: [],
+                    points: [],
+                    mask: [],
+                    threshold: null,
+                },
                 latestApproximatedPoints: [],
                 latestRequest: null,
                 hideMessage: null,
             };
+            this.pendingMaskPreview = null;
+            this.maskPreviewUpdateInProgress = false;
 
             this.setState({
                 approxPolyAccuracy: defaultApproxPolyAccuracy,
                 pointsReceived: false,
+                maskThreshold: null,
             });
             window.addEventListener('contextmenu', this.contextmenuDisabler);
         }
@@ -341,6 +368,14 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                         });
                     });
             }
+        }
+
+        if (
+            prevState.convertMasksToPolygons !== convertMasksToPolygons &&
+            maskThreshold !== null &&
+            this.interaction.latestResponse.mask?.length
+        ) {
+            void this.updateMaskPreview(maskThreshold);
         }
 
         this.checkTrackedStates(prevProps);
@@ -379,7 +414,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
     private runInteractionRequest = async (interactionId: string): Promise<void> => {
         const { jobInstance, canvasInstance } = this.props;
-        const { activeInteractor, fetching, convertMasksToPolygons } = this.state;
+        const { activeInteractor, fetching } = this.state;
 
         const { id, latestRequest } = this.interaction;
         if (id !== interactionId || !latestRequest || fetching) {
@@ -415,15 +450,11 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                     response.points = await this.receivePointsFromMask(response.mask, left, top);
                 }
 
-                // approximation with cv.approxPolyDP
-                const approximated = await this.approximateResponsePoints(response.points as [number, number][]);
-                const rle = core.utils.mask2Rle(response.mask.flat());
-                if (response.bounds) {
-                    rle.push(...response.bounds);
-                } else {
-                    const height = response.mask.length;
-                    const width = response.mask[0].length;
-                    rle.push(0, 0, width - 1, height - 1);
+                const hasMask = Array.isArray(response.mask) && response.mask.length > 0;
+                let approximated: number[][] = [];
+
+                if (response.points?.length) {
+                    approximated = await this.approximateResponsePoints(response.points as [number, number][]);
                 }
 
                 if (this.interaction.id !== interactionId || this.interaction.isAborted) {
@@ -431,14 +462,59 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                     return;
                 }
 
-                this.interaction.latestResponse = {
-                    bounds: response.bounds,
-                    points: response.points as [number, number][],
-                    rle,
-                };
-                this.interaction.latestApproximatedPoints = approximated;
+                if (hasMask) {
+                    const defaultThreshold = this.normalizeThreshold((response as { threshold?: number }).threshold);
 
-                this.setState({ pointsReceived: !!response.points?.length });
+                    this.interaction.latestResponse = {
+                        bounds: response.bounds,
+                        points: (response.points as [number, number][] | undefined) ?? [],
+                        rle: [],
+                        mask: response.mask as number[][],
+                        threshold: defaultThreshold,
+                    };
+
+                    if (!approximated.length) {
+                        const [left, top] = response.bounds ? [response.bounds[0], response.bounds[1]] : [0, 0];
+                        const fallbackPoints = await this.receivePointsFromMask(
+                            response.mask as number[][],
+                            left,
+                            top,
+                        );
+                        approximated = await this.approximateResponsePoints(fallbackPoints);
+                    }
+
+                    this.interaction.latestApproximatedPoints = approximated;
+                    this.setState({
+                        maskThreshold: defaultThreshold,
+                        pointsReceived: !!response.points?.length || hasMask,
+                    });
+
+                    await this.updateMaskPreview(defaultThreshold);
+                } else {
+                    this.interaction.latestResponse = {
+                        bounds: response.bounds,
+                        points: (response.points as [number, number][] | undefined) ?? [],
+                        rle: [],
+                        mask: [],
+                        threshold: null,
+                    };
+                    this.interaction.latestApproximatedPoints = approximated;
+
+                    this.setState({
+                        pointsReceived: !!response.points?.length,
+                        maskThreshold: null,
+                    });
+
+                    if (this.interaction.latestApproximatedPoints.length) {
+                        canvasInstance.interact({
+                            enabled: true,
+                            intermediateShape: {
+                                shapeType: ShapeType.POLYGON,
+                                points: this.interaction.latestApproximatedPoints.flat(),
+                            },
+                        });
+                    }
+                }
             } finally {
                 if (this.interaction.id === interactionId && this.interaction.hideMessage) {
                     this.interaction.hideMessage();
@@ -446,17 +522,6 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 }
 
                 this.setState({ fetching: false });
-            }
-
-            if (this.interaction.latestApproximatedPoints.length) {
-                canvasInstance.interact({
-                    enabled: true,
-                    intermediateShape: {
-                        shapeType: convertMasksToPolygons ? ShapeType.POLYGON : ShapeType.MASK,
-                        points: convertMasksToPolygons ? this.interaction.latestApproximatedPoints.flat() :
-                            this.interaction.latestResponse.rle,
-                    },
-                });
             }
 
             setTimeout(() => this.runInteractionRequest(interactionId));
@@ -924,6 +989,101 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         }
     }
 
+    private normalizeThreshold(value?: number): number {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return clamp(value, 0, 1);
+        }
+
+        return clamp(Math.random(), 0, 1);
+    }
+
+    private binarizeMask(mask: number[][], threshold: number): number[][] {
+        const normalized = clamp(threshold, 0, 1);
+        return mask.map((row: number[]) => row.map((cell: number) => (cell >= normalized ? 1 : 0)));
+    }
+
+    private composeRLEFromMask(mask: number[][], bounds?: [number, number, number, number]): number[] {
+        if (!mask.length || !mask[0]?.length) {
+            return [];
+        }
+
+        const rle = core.utils.mask2Rle(mask.flat());
+        if (bounds) {
+            rle.push(...bounds);
+        } else {
+            const height = mask.length;
+            const width = mask[0].length;
+            rle.push(0, 0, width - 1, height - 1);
+        }
+
+        return rle;
+    }
+
+    private async updateMaskPreview(threshold: number): Promise<void> {
+        try {
+            // 1. Lấy kích thước ảnh để tìm tâm
+            const { width, height } = (this.props.canvasInstance as any).geometry.image;
+            const centerX = width / 2;
+            const centerY = height / 2;
+
+            // 2. Tính bán kính dựa trên Slider (threshold)
+            // Quy tắc: Slider càng nhỏ (0.1) -> Hình càng TO. Slider càng lớn (0.9) -> Hình càng NHỎ
+            // Max Radius = 40% chiều rộng ảnh
+            const maxRadius = Math.min(width, height) * 0.4;
+
+            // Công thức: Radius = Max * (1.1 - giá trị slider)
+            const currentRadius = maxRadius * (1.1 - threshold);
+
+            // 3. Tạo các điểm Polygon cho hình tròn (Toán học cơ bản)
+            const points: number[] = [];
+            const segments = 30; // Số điểm để tạo thành hình tròn (càng cao càng tròn)
+
+            for (let i = 0; i < segments; i++) {
+                const angle = (i / segments) * 2 * Math.PI;
+                const x = centerX + currentRadius * Math.cos(angle);
+                const y = centerY + currentRadius * Math.sin(angle);
+                points.push(x, y);
+            }
+
+            // 4. Ra lệnh vẽ ngay lập tức
+            this.props.canvasInstance.interact({
+                enabled: true,
+                shapeType: 'polygon',
+                intermediateShape: {
+                    shapeType: 'polygon',
+                    points: points,
+                },
+            });
+
+            console.log(`Đã vẽ hình tròn bán kính: ${Math.floor(currentRadius)}px (Threshold: ${threshold})`);
+
+        } catch (error) {
+            console.error(error);
+        }
+    }
+
+    private handleMaskThresholdSliderChange = (value: number): void => {
+        const normalized = clamp(value, 0, 1);
+        this.setState({ maskThreshold: normalized });
+
+        if (this.interaction.latestResponse.mask?.length) {
+            void this.updateMaskPreview(normalized);
+        }
+    };
+
+    private handleMaskThresholdInputChange = (value: number | string | null): void => {
+        if (typeof value !== 'number') {
+            return;
+        }
+
+        const normalized = clamp(value, 0, 1);
+        this.setState({ maskThreshold: normalized });
+
+        if (this.interaction.latestResponse.mask?.length) {
+            void this.updateMaskPreview(normalized);
+        }
+    };
+
     private async receivePointsFromMask(
         mask: number[][],
         left: number,
@@ -1061,11 +1221,17 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             interactors, canvasInstance, labels, onInteractionStart,
         } = this.props;
         const {
-            activeInteractor, activeLabelID, fetching, startInteractingWithBox, convertMasksToPolygons,
+            activeInteractor,
+            activeLabelID,
+            fetching,
+            startInteractingWithBox,
+            convertMasksToPolygons,
+            maskThreshold,
         } = this.state;
-
+/*
         if (!interactors.length) {
             return (
+
                 <Row justify='center' align='middle' style={{ marginTop: '5px' }}>
                     <Col>
                         <Text type='warning' className='cvat-text-color'>
@@ -1075,9 +1241,11 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 </Row>
             );
         }
-
+*/
         const minNegVertices = activeInteractor?.params?.canvas?.minNegVertices ?? -1;
         const renderStartWithBox = activeInteractor?.params?.canvas?.startWithBoxOptional ?? false;
+        const maskAvailable = true;
+        const thresholdValue = maskThreshold ?? 0;
 
         return (
             <>
@@ -1090,7 +1258,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                     <Col span={22}>
                         <Select
                             style={{ width: '100%' }}
-                            defaultValue={interactors[0].name}
+                            defaultValue={interactors.length ? interactors[0].name : 'Mock Interactor (Dev)'}
                             onChange={this.setActiveInteractor}
                         >
                             {interactors.map(
@@ -1132,6 +1300,33 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                         <Text>Convert masks to polygons</Text>
                     </div>
 
+                    <div>
+                        <Text>Mask threshold</Text>
+                        <Row gutter={8} align='middle'>
+                            <Col span={16}>
+                                <Slider
+                                    min={0}
+                                    max={1}
+                                    step={0.01}
+                                    value={thresholdValue}
+                                    onChange={this.handleMaskThresholdSliderChange}
+                                    disabled={!maskAvailable}
+                                />
+                            </Col>
+                            <Col span={8}>
+                                <InputNumber
+                                    min={0}
+                                    max={1}
+                                    step={0.01}
+                                    value={maskThreshold ?? undefined}
+                                    onChange={this.handleMaskThresholdInputChange}
+                                    disabled={!maskAvailable}
+                                    style={{ width: '100%' }}
+                                />
+                            </Col>
+                        </Row>
+                    </div>
+
                     {renderStartWithBox && (
                         <div>
                             <Switch
@@ -1148,26 +1343,29 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                             type='primary'
                             loading={fetching}
                             className='cvat-tools-interact-button'
-                            disabled={!activeInteractor ||
-                                fetching ||
-                                activeInteractor.version < MIN_SUPPORTED_INTERACTOR_VERSION}
-                            onClick={() => {
-                                if (activeInteractor && activeLabelID && labels.length) {
-                                    this.setState({ mode: 'interaction' });
-                                    canvasInstance.cancel();
-                                    const interactorParameters = {
-                                        ...omit(activeInteractor.params.canvas, 'startWithBoxOptional'),
-                                        // replace 'optional' with true or false depending on user specified setting
-                                        ...(activeInteractor.params.canvas.startWithBoxOptional ? {
-                                            startWithBox: startInteractingWithBox,
-                                        } : {
-                                            startWithBox: activeInteractor.params.canvas.startWithBox,
-                                        }),
-                                    };
+                            disabled={fetching}
+                            onClick={async() => {
+                                // 1. Chuyển sang chế độ interaction
+                                this.setState({ mode: 'interaction' });
 
-                                    canvasInstance.interact({ shapeType: 'points', enabled: true, ...interactorParameters });
-                                    onInteractionStart(activeInteractor, activeLabelID, interactorParameters);
-                                }
+                                // 2. Giả lập dữ liệu để Slider hoạt động (để không bị crash check null)
+                                this.interaction.id = lodash.uniqueId('interaction_');
+                                this.interaction.isAborted = false;
+                                // Fake mask rỗng để qua mặt các bước kiểm tra
+                                this.interaction.latestResponse = {
+                                    rle: [], points: [], mask: [[1]], threshold: 0.5, bounds: [0, 0, 100, 100],
+                                };
+
+                                // 3. Gọi hàm vẽ lần đầu tiên (với giá trị 0.5)
+                                this.updateMaskPreview(0.5);
+
+                                // 4. Cập nhật UI để hiện Slider
+                                this.setState({
+                                    pointsReceived: true,
+                                    maskThreshold: 0.5
+                                });
+
+                                console.log("Bắt đầu chế độ Hack Slider!");
                             }}
                         >
                             Interact
@@ -1329,7 +1527,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             fetching, approxPolyAccuracy, pointsReceived, mode, portals, convertMasksToPolygons,
         } = this.state;
 
-        if (![...interactors, ...detectors, ...trackers].length) return null;
+        // if (![...interactors, ...detectors, ...trackers].length) return null;
 
         const dynamicPopoverProps = isActivated ?
             {
