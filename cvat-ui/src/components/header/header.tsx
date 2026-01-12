@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 import './styles.scss';
-import React, { useCallback, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { connect } from 'react-redux';
 import { useHistory, useLocation } from 'react-router';
 import { Row, Col } from 'antd/lib/grid';
@@ -28,6 +28,7 @@ import Button from 'antd/lib/button';
 import Dropdown from 'antd/lib/dropdown';
 import Modal from 'antd/lib/modal';
 import Text from 'antd/lib/typography/Text';
+import message from 'antd/lib/message';
 
 import config from 'config';
 
@@ -182,6 +183,7 @@ function HeaderComponent(props: Props): JSX.Element {
     } = config;
 
     const isMounted = useIsMounted();
+    const [fetchingLogit, setFetchingLogit] = useState(false);
 
     useEffect(() => {
         if (isMounted()) {
@@ -206,6 +208,27 @@ function HeaderComponent(props: Props): JSX.Element {
             }
         },
     };
+
+    const handleFetchLogit = useCallback(async (): Promise<void> => {
+        setFetchingLogit(true);
+        try {
+            const response = await fetch('/api/logit/fetch-logit/', {
+                credentials: 'include',
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(errorText || 'Failed to fetch logit');
+            }
+
+            const data = await response.json();
+            message.success(data?.message || 'Fetched logit');
+        } catch (error: any) {
+            message.error(error?.message || 'Failed to fetch logit');
+        } finally {
+            setFetchingLogit(false);
+        }
+    }, []);
 
     const aboutPlugins = usePlugins((state: CombinedState) => state.plugins.components.about.links.items, props);
     const aboutLinks: [JSX.Element, number][] = [];
@@ -496,10 +519,8 @@ function HeaderComponent(props: Props): JSX.Element {
                 <Button
                     type='primary'
                     className='cvat-fetch-logit-button'
-                    onClick={(): void => {
-                        console.log('Fetch logit clicked');
-                        // TODO: Implement fetch logit logic
-                    }}
+                    loading={fetchingLogit}
+                    onClick={handleFetchLogit}
                 >
                     Fetch logit
                 </Button>
