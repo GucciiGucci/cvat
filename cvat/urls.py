@@ -55,3 +55,5 @@ if apps.is_installed("cvat.apps.consensus"):
 
 if apps.is_installed("cvat.apps.access_tokens"):
     urlpatterns.append(path("api/", include("cvat.apps.access_tokens.urls")))
+
+ 

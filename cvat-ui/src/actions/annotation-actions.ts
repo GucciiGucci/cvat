@@ -1009,7 +1009,7 @@ export function getJobAsync({
 }
 
 export function saveAnnotationsAsync(): ThunkAction {
-    return async (dispatch: ThunkDispatch): Promise<void> => {
+    return async (dispatch: ThunkDispatch, getState): Promise<void> => {
         const { jobInstance } = receiveAnnotationsParameters();
 
         dispatch({
@@ -1033,6 +1033,88 @@ export function saveAnnotationsAsync(): ThunkAction {
                 type: AnnotationActionTypes.SAVE_ANNOTATIONS_SUCCESS,
                 payload: {},
             });
+
+            // Tự động lưu logit sau khi save annotation thành công
+            try {
+                const state = getState();
+                const { job, player, canvas } = state.annotation;
+                
+                if (job.instance && canvas.instance) {
+                    const jobId = job.instance.id;
+                    const frame = player.frame.number;
+                    const frameData = player.frame.data;
+                    
+                    // Lấy canvas image nếu có
+                    let imageData: string | undefined;
+                    let width: number | undefined;
+                    let height: number | undefined;
+                    
+                    // Thử lấy từ canvas instance
+                    try {
+                        if (canvas.instance && typeof (canvas.instance as any).html === 'function') {
+                            const canvasElement = (canvas.instance as any).html();
+                            
+                            // Canvas có thể là HTMLCanvasElement hoặc container element
+                            let actualCanvas: HTMLCanvasElement | null = null;
+                            
+                            if (canvasElement instanceof HTMLCanvasElement) {
+                                actualCanvas = canvasElement;
+                            } else if (canvasElement && canvasElement.querySelector) {
+                                // Nếu là container, tìm canvas bên trong
+                                actualCanvas = canvasElement.querySelector('canvas') as HTMLCanvasElement;
+                            }
+                            
+                            if (actualCanvas) {
+                                imageData = actualCanvas.toDataURL('image/png').split(',')[1];
+                                width = actualCanvas.width;
+                                height = actualCanvas.height;
+                                console.log(`✅ Canvas image extracted: ${width}x${height}, data size: ${imageData.length}`);
+                            } else {
+                                console.warn('⚠️ Could not find canvas element in canvas.instance.html()');
+                            }
+                        }
+                    } catch (error) {
+                        console.warn('⚠️ Error extracting canvas image:', error);
+                    }
+                    
+                    // Nếu không lấy được từ canvas, thử lấy từ frameData
+                    if (!imageData && frameData) {
+                        try {
+                            const imageResult = await frameData.data();
+                            if (imageResult && imageResult.imageData) {
+                                // Convert ImageBitmap hoặc Blob thành base64
+                                if (imageResult.imageData instanceof ImageBitmap) {
+                                    const tempCanvas = document.createElement('canvas');
+                                    tempCanvas.width = imageResult.renderWidth || imageResult.imageData.width;
+                                    tempCanvas.height = imageResult.renderHeight || imageResult.imageData.height;
+                                    const ctx = tempCanvas.getContext('2d');
+                                    if (ctx) {
+                                        ctx.drawImage(imageResult.imageData, 0, 0);
+                                        imageData = tempCanvas.toDataURL('image/png').split(',')[1];
+                                        width = tempCanvas.width;
+                                        height = tempCanvas.height;
+                                        console.log(`✅ Frame image extracted: ${width}x${height}`);
+                                    }
+                                } else if (imageResult.imageData instanceof Blob) {
+                                    const arrayBuffer = await imageResult.imageData.arrayBuffer();
+                                    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+                                    imageData = base64;
+                                    width = imageResult.renderWidth;
+                                    height = imageResult.renderHeight;
+                                    console.log(`✅ Frame blob extracted: ${width}x${height}`);
+                                }
+                            }
+                        } catch (error) {
+                            console.warn('⚠️ Error extracting frame image:', error);
+                        }
+                    }
+                    
+                    // (logit) removed
+                }
+            } catch (error) {
+                // Không throw error để không ảnh hưởng đến save annotation
+                console.warn('Could not save logit after annotation save:', error);
+            }
 
             dispatch(fetchAnnotationsAsync());
         } catch (error) {

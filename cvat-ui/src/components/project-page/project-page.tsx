@@ -339,7 +339,7 @@ export default function ProjectPageComponent(): JSX.Element {
                                         className='cvat-create-task-button'
                                         onClick={() => history.push(`/tasks/create?projectId=${id}`)}
                                     >
-                                        Create a new task
+                                        Create a new task test hehehe
                                     </Button>
                                     <Button
                                         type='primary'

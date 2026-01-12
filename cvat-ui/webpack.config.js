@@ -9,7 +9,7 @@ const HtmlWebpackPlugin = require('html-webpack-plugin');
 const Dotenv = require('dotenv-webpack');
 const CopyPlugin = require('copy-webpack-plugin');
 
-module.exports = (env) => {
+module.exports = (env, argv) => {
     const defaultAppConfig = path.join(__dirname, 'src/config.tsx');
     const defaultPlugins = ['plugins/sam'];
 
@@ -35,10 +35,11 @@ module.exports = (env) => {
 
     const host = process.env.CVAT_UI_HOST ?? 'localhost';
     const port = process.env.CVAT_UI_PORT ?? 3000;
+    const isDevelopment = process.env.NODE_ENV === 'development' || (argv && argv.mode === 'development');
     return {
         target: 'web',
-        mode: 'production',
-        devtool: sourceMapsDisabled ? false : 'source-map',
+        mode: isDevelopment ? 'development' : 'production',
+        devtool: sourceMapsDisabled ? false : (isDevelopment ? 'eval-source-map' : 'source-map'),
         entry: {
             'cvat-ui': './src/index.tsx',
             ...transformedPlugins,
@@ -52,6 +53,9 @@ module.exports = (env) => {
             host,
             port,
             compress: false,
+            hot: isDevelopment,
+            liveReload: isDevelopment,
+            watchFiles: isDevelopment ? ['src/**/*'] : false,
             client: {
                 overlay: false,
                 webSocketURL: 'ws://0.0.0.0:0/ws',

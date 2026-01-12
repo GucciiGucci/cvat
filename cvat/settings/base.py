@@ -596,6 +596,30 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
     "x-organization",
 ]
 
+# CSRF Trusted Origins - allows requests from these origins
+# Can be set via environment variable CSRF_TRUSTED_ORIGINS (comma-separated)
+# Default includes common development origins
+csrf_trusted_origins_env = os.environ.get("CSRF_TRUSTED_ORIGINS", "")
+if csrf_trusted_origins_env:
+    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in csrf_trusted_origins_env.split(",") if origin.strip()]
+else:
+    # Default trusted origins for development
+    CSRF_TRUSTED_ORIGINS = [
+        "http://localhost:3000",  # Webpack dev server
+        "http://127.0.0.1:3000",
+        "http://localhost:8080",  # Traefik/proxy
+        "http://127.0.0.1:8080",
+    ]
+
+# CORS settings - allow credentials and configure allowed origins
+CORS_ALLOW_CREDENTIALS = True
+cors_origin_whitelist_env = os.environ.get("CORS_ORIGIN_WHITELIST", "")
+if cors_origin_whitelist_env:
+    CORS_ORIGIN_WHITELIST = [origin.strip() for origin in cors_origin_whitelist_env.split(",") if origin.strip()]
+else:
+    # Default CORS origins (same as CSRF trusted origins)
+    CORS_ORIGIN_WHITELIST = CSRF_TRUSTED_ORIGINS.copy()
+
 TUS_MAX_FILE_SIZE = 26843545600  # 25gb
 TUS_DEFAULT_CHUNK_SIZE = 104857600  # 100 mb
 
