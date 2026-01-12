@@ -21,9 +21,22 @@ Including another URLconf
 from django.apps import apps
 from django.contrib import admin
 from django.urls import include, path
+from django.http import JsonResponse
+from django.views.decorators.http import require_GET
+from django.contrib.auth.decorators import login_required
+
+
+@require_GET
+@login_required
+def fetch_logit_dummy_view(_request):
+    """Return a simple dummy payload for fetch-logit button."""
+    return JsonResponse({"message": "dummy logit fetched"})
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    # IMPORTANT: This route must be before other includes to avoid conflicts
+    path("api/logit/fetch-logit/", fetch_logit_dummy_view, name="fetch-logit-dummy"),
     path("", include("cvat.apps.engine.urls")),
     path("", include("cvat.apps.redis_handler.urls")),
     path("django-rq/", include("django_rq.urls")),
